@@ -15,6 +15,7 @@ import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import org.eclipse.paho.client.mqttv3.MqttClient;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import com.sensormonitor.messageschema.MqttTopics;
 import java.nio.charset.StandardCharsets;
@@ -82,11 +83,11 @@ public class WarehouseService {
     }
 
     private SensorMeasurement parse(String raw, SensorType type) {
-        try {
+        try
+        {
             String[] parts = raw.trim().split(";");
             String sensorId = parts[0].split("=")[1].trim();
             double value = Double.parseDouble(parts[1].split("=")[1].trim());
-
             return new SensorMeasurement(warehouseId, sensorId, type, value, Instant.now());
         } catch (Exception ex) {
             log.warn("Invalid message: '{}'", raw);
@@ -95,6 +96,7 @@ public class WarehouseService {
     }
 
     private void insertAsCircularBuffer(SensorMeasurement measurement) {
+        log.info("Inserting into Queue. queueSize:{}", queue.size());
         while (!queue.offer(measurement)) {
             queue.poll();
         }
@@ -130,7 +132,8 @@ public class WarehouseService {
                     socket.receive(packet);
 
                     String raw = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
-                    log.info("Received [{}:{}]: {}", sensorType, port, raw);
+                    String senderIp = packet.getAddress().getHostAddress();
+                    log.info("Received from {} [{}:{}]: {}", senderIp, sensorType, port, raw);
 
                     SensorMeasurement measurement = parse(raw, sensorType);
                     if (measurement != null) {
@@ -153,50 +156,79 @@ public class WarehouseService {
 
         MeasurementConsumer(String name) {
             super(name);
-            try {
-                mqttClient = new MqttClient(mqttBrokerUrl,
-                        mqttClientPrefix + java.util.UUID.randomUUID().toString(), null);
-                MqttConnectOptions options = new MqttConnectOptions();
-                options.setAutomaticReconnect(true);
-                options.setCleanSession(true);
-                mqttClient.connect(options);
-            } catch (Exception e) {
-                log.error("Failed to initialize MQTT Client", e);
+        }
+
+        private void initMqttClient() throws MqttException 
+        {
+            mqttClient = new MqttClient(mqttBrokerUrl,
+                    mqttClientPrefix + java.util.UUID.randomUUID().toString(), null);
+            MqttConnectOptions options = new MqttConnectOptions();
+            options.setAutomaticReconnect(true);
+            options.setCleanSession(true);
+            mqttClient.connect(options);
+        }
+
+        private void tryUntillSuceedConnectToMqtt() 
+        {
+            while (keepRunning && mqttClient == null) 
+            {
+                try 
+                {
+                    initMqttClient();
+                    log.info("MQTT Client connected. Url: {}", mqttBrokerUrl);
+                }
+                catch (Exception e) 
+                {
+                    log.error("Failed to initialize MQTT Client.Url: {}. Retrying in 1s...", mqttBrokerUrl, e);
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
             }
         }
 
-        private void forwardMeasurement(SensorMeasurement measurement) {
-            try {
-                String json = objectMapper.writeValueAsString(measurement);
-                log.info("Publishing MQTT message for {}: {} = {} at {}",
-                        measurement.sensorId(), measurement.sensorType(), measurement.value(), measurement.timestamp());
+        private void forwardMeasurement(SensorMeasurement measurement) 
+        {
+            try 
+            {
+                log.info("Publishing MQTT message: {}", measurement);
 
-                if (mqttClient != null && mqttClient.isConnected()) {
-                    MqttMessage message = new MqttMessage(json.getBytes(StandardCharsets.UTF_8));
-                    message.setQos(1);
-                    String topic = MqttTopics.getSensorTopic(measurement.sensorId());
-                    mqttClient.publish(topic, message);
-                } else {
-                    log.warn("MQTT client not connected. Dropped: {}", measurement.sensorId());
-                }
-            } catch (Exception e) {
+                String json = objectMapper.writeValueAsString(measurement);
+                MqttMessage message = new MqttMessage(json.getBytes(StandardCharsets.UTF_8));
+                message.setQos(1);
+                String topic = MqttTopics.getSensorTopic(measurement.sensorId());
+                mqttClient.publish(topic, message);                
+            } 
+            catch (Exception e) 
+            {
                 log.warn("Failed to publish to MQTT: {}", e.getMessage());
             }
         }
 
         @Override
-        public void run() {
+        public void run() 
+        {
             log.info("Consumer started");
-            try {
-                while (keepRunning) {
-                    while (!queue.isEmpty()) {
-                        if (mqttClient == null || !mqttClient.isConnected()) {
+            tryUntillSuceedConnectToMqtt();        
+            try 
+            {
+                while (keepRunning) 
+                {
+                    while (!queue.isEmpty())
+                    {
+                        if (!mqttClient.isConnected()) 
+                        {
+                            log.warn("MQTT client not connected. Retrying in 1s...");
+                            Thread.sleep(1000);
                             break;
                         }
                         SensorMeasurement measurement = queue.take();
                         log.info("Processed: {}", measurement);
                         forwardMeasurement(measurement);
                     }
+                    // when queue is empty, check it every 100ms
                     Thread.sleep(100);
                 }
                 // Graceful shutdown
@@ -205,9 +237,10 @@ public class WarehouseService {
                     log.info("Processed (Shutdown): {}", measurement);
                     forwardMeasurement(measurement);
                 }
-
                 log.info("Consumer stopped");
-            } catch (InterruptedException ex) {
+            } 
+            catch (InterruptedException ex) 
+            {
                 Thread.currentThread().interrupt();
                 log.error("Consumer interrupted", ex);
             }

@@ -30,6 +30,8 @@ public class MqttSensorSubscriber implements MqttCallback {
     private final AlarmService alarmService;
     private final ObjectMapper objectMapper;
     private MqttClient mqttClient;
+    private volatile boolean keepRunning = true;
+    private MqttConnector connectorThread;
 
     @org.springframework.beans.factory.annotation.Autowired
     public MqttSensorSubscriber(AlarmService alarmService) {
@@ -39,26 +41,56 @@ public class MqttSensorSubscriber implements MqttCallback {
 
     @PostConstruct
     public void start() {
-        try {
-            String clientId = mqttClientPrefix + UUID.randomUUID().toString();
-            mqttClient = new MqttClient(brokerUrl, clientId, null);
-            MqttConnectOptions options = new MqttConnectOptions();
-            options.setAutomaticReconnect(true);
-            options.setCleanSession(true);
-            options.setConnectionTimeout(10);
+        connectorThread = new MqttConnector();
+        connectorThread.start();
+    }
 
-            mqttClient.setCallback(this);
-            mqttClient.connect(options);
-            mqttClient.subscribe(topic, 1);
-
-            log.info("Connected to MQTT Broker at {} and subscribed to '{}'", brokerUrl, topic);
-        } catch (MqttException e) {
-            log.error("Failed to connect to MQTT broker", e);
+    private class MqttConnector extends Thread {
+        public MqttConnector() {
+            super("MqttConnectorThread");
         }
+
+        @Override
+        public void run() 
+        {
+            while (keepRunning && mqttClient == null) 
+            {
+                try 
+                {
+                    initMqttClient();
+                    log.info("MQTT Client connected. Url: {}", brokerUrl);
+                } 
+                catch (Exception e) 
+                {
+                    log.error("Failed to initialize MQTT Client. Url: {}. Retrying in 1s...", brokerUrl, e);
+                    try 
+                    {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        }
+    }
+
+    private void initMqttClient() throws MqttException 
+    {
+        String clientId = mqttClientPrefix + UUID.randomUUID().toString();
+        mqttClient = new MqttClient(brokerUrl, clientId, null);
+        MqttConnectOptions options = new MqttConnectOptions();
+        options.setAutomaticReconnect(true);
+        options.setCleanSession(true);
+        mqttClient.setCallback(this);
+        mqttClient.connect(options);
+        mqttClient.subscribe(topic, 1);
+
+        log.info("Connected to MQTT Broker at {} and subscribed to '{}'", brokerUrl, topic);
     }
 
     @PreDestroy
     public void stop() {
+        keepRunning = false;
         try {
             if (mqttClient != null && mqttClient.isConnected()) {
                 mqttClient.disconnect();
