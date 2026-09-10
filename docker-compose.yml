@@ -1,0 +1,41 @@
+name: sensor-monitor-group
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: sensor-mosquitto
+    ports:
+      - "1883:1883"
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+    #Simple no-auth config for tests
+    command: mosquitto -c /mosquitto-no-auth.conf
+    entrypoint: /bin/sh -c "echo 'listener 1883' > /mosquitto/config/mosquitto.conf && echo 'allow_anonymous true' >> /mosquitto/config/mosquitto.conf && /docker-entrypoint.sh mosquitto -c /mosquitto/config/mosquitto.conf"
+
+  warehouse:
+    build:
+      context: .
+      dockerfile: warehouse/Dockerfile
+    container_name: sensor-warehouse
+    ports:
+      - "3344:3344/udp"
+      - "3355:3355/udp"
+    environment:
+      - MQTT_BROKER_URL=tcp://mosquitto:1883
+    depends_on:
+      - mosquitto
+
+  center:
+    build:
+      context: .
+      dockerfile: center/Dockerfile
+    container_name: sensor-center
+    environment:
+      - MQTT_BROKER_URL=tcp://mosquitto:1883
+    depends_on:
+      - mosquitto
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:
