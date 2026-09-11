@@ -1,5 +1,8 @@
 package com.sensormonitor.warehouse;
 
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -47,7 +50,7 @@ public class WarehouseService {
     @Value("${warehouse.id:default-warehouse}")
     private String warehouseId;
 
-    private final BlockingQueue<SensorMeasurement> queue;
+    private final BlockingQueue<RawMessage> queue;
 
     public WarehouseService(@Value("${queue.capacity:100000}") int queueCapacity) {
         this.queue = new ArrayBlockingQueue<>(queueCapacity);
@@ -82,33 +85,36 @@ public class WarehouseService {
         }
     }
 
-    private SensorMeasurement parse(String raw, SensorType type) {
+    private SensorMeasurement parse(RawMessage rawMessage) {
         try
         {
+            String raw = rawMessage.getRaw();
+            SensorType type = rawMessage.getSensorType();
             String[] parts = raw.trim().split(";");
             String sensorId = parts[0].split("=")[1].trim();
             double value = Double.parseDouble(parts[1].split("=")[1].trim());
             return new SensorMeasurement(warehouseId, sensorId, type, value, Instant.now());
         } catch (Exception ex) {
-            log.warn("Invalid message: '{}'", raw);
+            log.warn("Invalid message: '{}'", rawMessage==null?"null":rawMessage.getRaw());
             return null;
         }
     }
 
-    private void insertAsCircularBuffer(SensorMeasurement measurement) {
-        log.info("Inserting into Queue. queueSize:{}", queue.size());
+    private void insertAsCircularBuffer(RawMessage measurement) {
+        //log.info("Inserting into Queue. queueSize:{}", queue.size());
         while (!queue.offer(measurement)) {
             queue.poll();
         }
     }
 
-    private class UdpProducer extends Thread {
-
+    private class UdpProducer extends Thread
+    {
         private final int port;
         private final SensorType sensorType;
         private DatagramSocket socket;
 
-        UdpProducer(String name, int port, SensorType sensorType) {
+        UdpProducer(String name, int port, SensorType sensorType) 
+        {
             super(name);
             this.port = port;
             this.sensorType = sensorType;
@@ -126,19 +132,18 @@ public class WarehouseService {
                 socket = new DatagramSocket(new InetSocketAddress("0.0.0.0", port));
                 log.info("{} listening on port {}", sensorType, port);
                 byte[] buffer = new byte[bufferSize];
-
-                while (keepRunning) {
-                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                while (keepRunning) 
+                {                  
+                    packet.setLength(buffer.length);
                     socket.receive(packet);
-
                     String raw = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
                     String senderIp = packet.getAddress().getHostAddress();
                     log.info("Received from {} [{}:{}]: {}", senderIp, sensorType, port, raw);
+                    
 
-                    SensorMeasurement measurement = parse(raw, sensorType);
-                    if (measurement != null) {
-                        insertAsCircularBuffer(measurement);
-                    }
+                    insertAsCircularBuffer(new RawMessage(raw, sensorType));
+                    
                 }
             } catch (Exception ex) {
                 if (keepRunning) {
@@ -149,6 +154,14 @@ public class WarehouseService {
                 log.info("{} stopped on port {}", sensorType, port);
             }
         }
+    }
+    @AllArgsConstructor
+    @Getter 
+    @Setter 
+    private class RawMessage 
+    {
+        private String raw;
+        private SensorType sensorType;       
     }
 
     private class MeasurementConsumer extends Thread {
@@ -165,6 +178,7 @@ public class WarehouseService {
             MqttConnectOptions options = new MqttConnectOptions();
             options.setAutomaticReconnect(true);
             options.setCleanSession(true);
+            options.setMaxInflight(50000);
             mqttClient.connect(options);
         }
 
@@ -224,16 +238,16 @@ public class WarehouseService {
                             Thread.sleep(1000);
                             break;
                         }
-                        SensorMeasurement measurement = queue.take();
-                        log.info("Processed: {}", measurement);
+                        SensorMeasurement measurement = parse(queue.take());
+                        log.info("Processed: {}, queueSize: {}", measurement, queue.size());
                         forwardMeasurement(measurement);
                     }
                     // when queue is empty, check it every 100ms
-                    Thread.sleep(100);
+                    Thread.sleep(1);
                 }
                 // Graceful shutdown
                 while (!queue.isEmpty()) {
-                    SensorMeasurement measurement = queue.take();
+                    SensorMeasurement measurement = parse(queue.take());
                     log.info("Processed (Shutdown): {}", measurement);
                     forwardMeasurement(measurement);
                 }
