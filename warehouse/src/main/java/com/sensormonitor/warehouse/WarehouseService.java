@@ -1,8 +1,5 @@
 package com.sensormonitor.warehouse;
 
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -47,10 +44,31 @@ public class WarehouseService {
     @Value("${mqtt.client.prefix:WarehousePublisher-}")
     private String mqttClientPrefix;
 
+    @Value("${mqtt.max-inflight:50000}")
+    private int maxInFlight;
+
+    @Value("${mqtt.reconnect.delay.ms:1000}")
+    private long mqttReconnectDelayMs;
+
+    @Value("${udp.bind.address:0.0.0.0}")
+    private String udpBindAddress;
+
     @Value("${warehouse.id:default-warehouse}")
     private String warehouseId;
 
-    private final BlockingQueue<RawMessage> queue;
+    @Value("${sensor.field.separator:;}")
+    private String fieldSeparator;
+
+    @Value("${sensor.value.separator:=}")
+    private String valueSeparator;
+
+    @Value("${sensor.field.name.sensor_id:sensor_id}")
+    private String sensorIdFieldName;
+
+    @Value("${sensor.field.name.value:value}")
+    private String valueFieldName;
+
+    private final BlockingQueue<SensorMeasurement> queue;
 
     public WarehouseService(@Value("${queue.capacity:100000}") int queueCapacity) {
         this.queue = new ArrayBlockingQueue<>(queueCapacity);
@@ -85,24 +103,40 @@ public class WarehouseService {
         }
     }
 
-    private SensorMeasurement parse(RawMessage rawMessage) {
+    private SensorMeasurement parse(String raw, SensorType type) {
         try
         {
-            String raw = rawMessage.getRaw();
-            SensorType type = rawMessage.getSensorType();
-            String[] parts = raw.trim().split(";");
-            String sensorId = parts[0].split("=")[1].trim();
-            double value = Double.parseDouble(parts[1].split("=")[1].trim());
+            String[] parts = raw.trim().split(fieldSeparator);
+            if(parts.length != 2)
+            {
+                log.warn("Invalid message format, field count != 2: '{}'", raw);
+                return null;
+            }
+            String[] sensorPart = parts[0].split(valueSeparator);
+            String[] valuePart = parts[1].split(valueSeparator);            
+            if (sensorPart.length != 2 || valuePart.length != 2) {
+                log.warn("Invalid message format, value count != 2: '{}'", raw);
+                return null;
+            }
+            if (!sensorPart[0].trim().equalsIgnoreCase(sensorIdFieldName) 
+                || !valuePart[0].trim().equalsIgnoreCase(valueFieldName)) {
+                log.warn("Invalid message format, field name does not match: '{}'", raw);
+                return null;
+            }
+            String sensorId = sensorPart[1].trim();
+            double value = Double.parseDouble(valuePart[1].trim());
             return new SensorMeasurement(warehouseId, sensorId, type, value, Instant.now());
         } catch (Exception ex) {
-            log.warn("Invalid message: '{}'", rawMessage==null?"null":rawMessage.getRaw());
+            log.warn("Invalid message: '{}'", raw);
             return null;
         }
     }
 
-    private void insertAsCircularBuffer(RawMessage measurement) {
-        //log.info("Inserting into Queue. queueSize:{}", queue.size());
-        while (!queue.offer(measurement)) {
+    private void insertAsCircularBuffer(SensorMeasurement measurement)
+    {
+        log.info("Inserting into Queue. queueSize:{}", queue.size());
+        while (!queue.offer(measurement)) 
+        {
             queue.poll();
         }
     }
@@ -129,8 +163,8 @@ public class WarehouseService {
         @Override
         public void run() {
             try {
-                socket = new DatagramSocket(new InetSocketAddress("0.0.0.0", port));
-                log.info("{} listening on port {}", sensorType, port);
+                socket = new DatagramSocket(new InetSocketAddress(udpBindAddress, port));
+                log.info("{} listening on port {} (bind: {})", sensorType, port, udpBindAddress);
                 byte[] buffer = new byte[bufferSize];
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
                 while (keepRunning) 
@@ -139,11 +173,12 @@ public class WarehouseService {
                     socket.receive(packet);
                     String raw = new String(packet.getData(), 0, packet.getLength(), StandardCharsets.UTF_8);
                     String senderIp = packet.getAddress().getHostAddress();
-                    log.info("Received from {} [{}:{}]: {}", senderIp, sensorType, port, raw);
-                    
+                    log.info("Received from {} [{}:{}]: {}", senderIp, sensorType, port, raw);                
 
-                    insertAsCircularBuffer(new RawMessage(raw, sensorType));
-                    
+                    SensorMeasurement measurement = parse(raw, sensorType);
+                    if (measurement != null) {
+                        insertAsCircularBuffer(measurement);
+                    }
                 }
             } catch (Exception ex) {
                 if (keepRunning) {
@@ -154,14 +189,6 @@ public class WarehouseService {
                 log.info("{} stopped on port {}", sensorType, port);
             }
         }
-    }
-    @AllArgsConstructor
-    @Getter 
-    @Setter 
-    private class RawMessage 
-    {
-        private String raw;
-        private SensorType sensorType;       
     }
 
     private class MeasurementConsumer extends Thread {
@@ -178,7 +205,7 @@ public class WarehouseService {
             MqttConnectOptions options = new MqttConnectOptions();
             options.setAutomaticReconnect(true);
             options.setCleanSession(true);
-            options.setMaxInflight(50000);
+            options.setMaxInflight(maxInFlight);
             mqttClient.connect(options);
         }
 
@@ -229,26 +256,21 @@ public class WarehouseService {
             try 
             {
                 while (keepRunning) 
-                {
-                    while (!queue.isEmpty())
+                {                   
+                    if (!mqttClient.isConnected()) 
                     {
-                        if (!mqttClient.isConnected()) 
-                        {
-                            log.warn("MQTT client not connected. Retrying in 1s...");
-                            Thread.sleep(1000);
-                            break;
-                        }
-                        SensorMeasurement measurement = parse(queue.take());
-                        log.info("Processed: {}, queueSize: {}", measurement, queue.size());
-                        forwardMeasurement(measurement);
+                        log.warn("MQTT client not connected. Retrying in {}ms...", mqttReconnectDelayMs);
+                        Thread.sleep(mqttReconnectDelayMs);
+                        continue;
                     }
-                    // when queue is empty, check it every 100ms
-                    Thread.sleep(1);
+                    SensorMeasurement measurement = queue.take();
+                    log.info("Processed: {}, queueSize: {}", measurement, queue.size());
+                    forwardMeasurement(measurement);                    
                 }
                 // Graceful shutdown
                 while (!queue.isEmpty()) {
-                    SensorMeasurement measurement = parse(queue.take());
-                    log.info("Processed (Shutdown): {}", measurement);
+                    SensorMeasurement measurement = queue.poll();
+                    log.info("Processed (Shutdown): {}, queueSize:{}", measurement, queue.size());
                     forwardMeasurement(measurement);
                 }
                 log.info("Consumer stopped");
